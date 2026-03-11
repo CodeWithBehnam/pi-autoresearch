@@ -117,18 +117,40 @@ const LogParams = Type.Object({
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Format a number with comma-separated thousands: 15586 → "15,586" */
+function commas(n: number): string {
+  const s = String(Math.round(n));
+  const parts: string[] = [];
+  for (let i = s.length; i > 0; i -= 3) {
+    parts.unshift(s.slice(Math.max(0, i - 3), i));
+  }
+  return parts.join(",");
+}
+
+/** Format number with commas, preserving one decimal for fractional values */
+function fmtNum(n: number, decimals: number = 0): string {
+  if (decimals > 0) {
+    const int = Math.floor(Math.abs(n));
+    const frac = (Math.abs(n) - int).toFixed(decimals).slice(1); // ".3"
+    return (n < 0 ? "-" : "") + commas(int) + frac;
+  }
+  return commas(n);
+}
+
 function formatMetric(value: number | null, unit: string): string {
   if (value === null) return "—";
-  if (unit === "s") return `${value.toFixed(1)}s`;
-  if (unit === "µs") return `${value.toLocaleString()}µs`;
-  if (unit === "ms") return `${value.toLocaleString()}ms`;
+  if (unit === "s") return `${fmtNum(value, 1)}s`;
+  if (unit === "µs") return `${fmtNum(value)}µs`;
+  if (unit === "ms") return `${fmtNum(value)}ms`;
+  if (Math.abs(value) >= 1000 && value === Math.round(value)) return fmtNum(value);
   return value.toFixed(6);
 }
 
 function formatCompact(value: number | null, unit: string): string {
   if (value === null) return "—";
-  if (unit === "s") return `${value.toFixed(1)}s`;
-  if (unit === "µs" || unit === "ms") return `${Math.round(value)}${unit}`;
+  if (unit === "s") return `${fmtNum(value, 1)}s`;
+  if (unit === "µs" || unit === "ms") return `${fmtNum(value)}${unit}`;
+  if (Math.abs(value) >= 1000 && value === Math.round(value)) return fmtNum(value);
   return value.toFixed(4);
 }
 
@@ -704,23 +726,22 @@ class DashboardComponent {
       const col = {
         idx: 4,
         commit: 9,
-        primary: 12,
-        baseline: 5, // "base" column - "📌" or ""
+        primary: 14,
         status: 9,
       };
       // Dynamic secondary metric columns
-      const secColWidth = 12;
+      const secColWidth = 14;
       const totalSecWidth = secMetrics.length * secColWidth;
       const descW = Math.max(
         10,
-        width - col.idx - col.commit - col.primary - totalSecWidth - col.baseline - col.status - 10
+        width - col.idx - col.commit - col.primary - totalSecWidth - col.status - 10
       );
 
-      // Table header — primary metric name is bolded
+      // Table header — primary metric name is bolded with ★
       let headerLine =
         `  ${th.fg("muted", "#".padEnd(col.idx))}` +
         `${th.fg("muted", "commit".padEnd(col.commit))}` +
-        `${th.fg("warning", th.bold(this.state.metricName.slice(0, col.primary - 1).padEnd(col.primary)))}`;
+        `${th.fg("warning", th.bold(("★ " + this.state.metricName).slice(0, col.primary - 1).padEnd(col.primary)))}`;
 
       for (const sm of secMetrics) {
         headerLine += th.fg(
@@ -730,7 +751,6 @@ class DashboardComponent {
       }
 
       headerLine +=
-        `${th.fg("muted", "base".padEnd(col.baseline))}` +
         `${th.fg("muted", "status".padEnd(col.status))}` +
         `${th.fg("muted", "description")}`;
 
@@ -774,8 +794,13 @@ class DashboardComponent {
           }
         }
 
+        // Show 📌 next to row number for baseline rows
+        const idxStr = isBaseline
+          ? th.fg("accent", `📌${String(i + 1)}`.padEnd(col.idx))
+          : th.fg("dim", String(i + 1).padEnd(col.idx));
+
         let rowLine =
-          `  ${th.fg("dim", String(i + 1).padEnd(col.idx))}` +
+          `  ${idxStr}` +
           `${th.fg("accent", r.commit.padEnd(col.commit))}` +
           `${th.fg(primaryColor, th.bold(primaryStr.padEnd(col.primary)))}`;
 
@@ -797,11 +822,6 @@ class DashboardComponent {
             rowLine += th.fg("dim", "—".padEnd(secColWidth));
           }
         }
-
-        // Baseline marker
-        rowLine += isBaseline
-          ? th.fg("accent", "📌 ".padEnd(col.baseline))
-          : "".padEnd(col.baseline);
 
         rowLine +=
           `${th.fg(color, r.status.padEnd(col.status))}` +
