@@ -11,17 +11,10 @@ Set up an autonomous experiment loop and start running immediately.
 
 You have two custom tools from the autoresearch extension. **Always use these instead of raw bash for experiments:**
 
+- **`init_experiment`** — call once at the start to configure the session. Sets the experiment name, primary metric name, unit, and direction. Writes config to `autoresearch.jsonl`. Do NOT call if `autoresearch.jsonl` already exists.
 - **`run_experiment`** — pass it a `command` to run. It times execution, captures output, detects pass/fail via exit code.
-- **`log_experiment`** — records each experiment's `commit`, `metric`, `status` (keep/discard/crash), and `description`. Automatically commits with a `Result: {...}` trailer. Persists state, updates the status widget and dashboard (toggle with ctrl+x).
-
-  **On the first call**, always set these to configure the display:
-  - `experiment_name` — human-readable session name (e.g. `"Optimizing liquid for fastest execution and parsing"`)
-  - `metric_name` — display name for primary metric (e.g. `"total_µs"`, `"bundle_kb"`, `"val_bpb"`)
-  - `metric_unit` — unit string that controls number formatting: `"µs"`, `"ms"`, `"s"`, `"kb"`, or `""` for unitless. Integers get comma-separated thousands; fractional values get 2 decimal places.
-  - `direction` — `"lower"` (default) or `"higher"` depending on what's better
-
-  **Optional params (any call):**
-  - `metrics` — dict of secondary metric name→value for tradeoff monitoring, e.g. `{"parse_µs": 5505, "render_µs": 1440}`
+- **`log_experiment`** — records each experiment's `commit`, `metric`, `status` (keep/discard/crash), and `description`. Auto-commits on `keep` with a `Result: {...}` trailer. Persists to `autoresearch.jsonl`. Dashboard toggle: ctrl+x.
+  - `metrics` — optional dict of secondary metric name→value for tradeoff monitoring, e.g. `{"parse_µs": 5505, "render_µs": 1440}`
 
   The first experiment is always the baseline. The inline widget shows the best metric vs baseline as a delta %, e.g. `★ total_µs: 6,945 (-21.2%)`.
 
@@ -144,8 +137,9 @@ echo "METRIC parse_us=$parse"
 - The agent uses `run_experiment` with `command: "./autoresearch.sh"` — make sure it's `chmod +x`.
 
 4. **Commit both files**: `git add autoresearch.md autoresearch.sh && git commit -m "autoresearch: setup experiment plan and runner"`
-5. **Run the baseline**: use `run_experiment` with `./autoresearch.sh`, parse the METRIC output, then `log_experiment` to record it. The first experiment automatically becomes the baseline. Set `metric_name`, `metric_unit`, and `direction` on this first call. Include secondary `metrics` from the METRIC lines.
-6. **Start looping** — do NOT wait for confirmation after the baseline. Go.
+5. **Initialize**: call `init_experiment` with the session name, primary metric name, unit, and direction.
+6. **Run the baseline**: use `run_experiment` with `./autoresearch.sh`, parse the METRIC output, then `log_experiment` to record it. The first experiment automatically becomes the baseline. Include secondary `metrics` from the METRIC lines.
+7. **Start looping** — do NOT wait for confirmation after the baseline. Go.
 
 ## Step 3: Experiment Loop
 

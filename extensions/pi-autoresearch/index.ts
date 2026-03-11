@@ -86,6 +86,29 @@ const RunParams = Type.Object({
   ),
 });
 
+const InitParams = Type.Object({
+  name: Type.String({
+    description:
+      'Human-readable name for this experiment session (e.g. "Optimizing liquid for fastest execution and parsing")',
+  }),
+  metric_name: Type.String({
+    description:
+      'Display name for the primary metric (e.g. "total_µs", "bundle_kb", "val_bpb"). Shown in dashboard headers.',
+  }),
+  metric_unit: Type.Optional(
+    Type.String({
+      description:
+        'Unit for the primary metric. Use "µs", "ms", "s", "kb", "mb", or "" for unitless. Affects number formatting. Default: ""',
+    })
+  ),
+  direction: Type.Optional(
+    Type.String({
+      description:
+        'Whether "lower" or "higher" is better for the primary metric. Default: "lower".',
+    })
+  ),
+});
+
 const LogParams = Type.Object({
   commit: Type.String({ description: "Git commit hash (short, 7 chars)" }),
   metric: Type.Number({
@@ -100,30 +123,6 @@ const LogParams = Type.Object({
     Type.Record(Type.String(), Type.Number(), {
       description:
         'Additional metrics to track as { name: value } pairs, e.g. { "compile_µs": 4200, "render_µs": 9800 }. These are shown alongside the primary metric for tradeoff monitoring.',
-    })
-  ),
-  experiment_name: Type.Optional(
-    Type.String({
-      description:
-        'Human-readable name for this experiment session (e.g. "Optimizing liquid for fastest execution"). Set on the first log_experiment call.',
-    })
-  ),
-  metric_name: Type.Optional(
-    Type.String({
-      description:
-        'Display name for the primary metric (e.g. "total_µs", "bundle_kb", "val_bpb"). Set on the first log_experiment call. Shown in dashboard headers.',
-    })
-  ),
-  metric_unit: Type.Optional(
-    Type.String({
-      description:
-        'Unit for the primary metric. Use "µs", "ms", "s", "kb", "mb", or "" for unitless. Affects number formatting (e.g. "s" shows one decimal, "µs"/"ms" show comma-separated integers). Set on the first log_experiment call.',
-    })
-  ),
-  direction: Type.Optional(
-    Type.String({
-      description:
-        'Whether "lower" or "higher" is better for the primary metric. Defaults to "lower". Set on the first log_experiment call.',
     })
   ),
   force: Type.Optional(
@@ -749,6 +748,87 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
+  // init_experiment tool — one-time setup
+  // -----------------------------------------------------------------------
+
+  pi.registerTool({
+    name: "init_experiment",
+    label: "Init Experiment",
+    description:
+      "Initialize the experiment session. Call once before the first run_experiment to set the name, primary metric, unit, and direction. Writes the config header to autoresearch.jsonl.",
+    promptSnippet:
+      "Initialize experiment session (name, metric, unit, direction). Call once before first run.",
+    promptGuidelines: [
+      "Call init_experiment exactly once at the start of an autoresearch session, before the first run_experiment.",
+      "If autoresearch.jsonl already exists with a config, do NOT call init_experiment again.",
+    ],
+    parameters: InitParams,
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      // Don't re-init if already configured from jsonl
+      if (state.results.length > 0) {
+        return {
+          content: [{
+            type: "text",
+            text: `⚠️ Experiment already initialized with ${state.results.length} results. Config: name="${state.name}", metric="${state.metricName}" (${state.metricUnit || "unitless"}, ${state.bestDirection} is better). To start fresh, delete autoresearch.jsonl.`,
+          }],
+          details: {},
+        };
+      }
+
+      state.name = params.name;
+      state.metricName = params.metric_name;
+      state.metricUnit = params.metric_unit ?? "";
+      if (params.direction === "lower" || params.direction === "higher") {
+        state.bestDirection = params.direction;
+      }
+
+      // Write config header to jsonl
+      try {
+        const jsonlPath = path.join(ctx.cwd, "autoresearch.jsonl");
+        const config = JSON.stringify({
+          type: "config",
+          name: state.name,
+          metricName: state.metricName,
+          metricUnit: state.metricUnit,
+          bestDirection: state.bestDirection,
+        });
+        fs.writeFileSync(jsonlPath, config + "\n");
+      } catch (e) {
+        return {
+          content: [{
+            type: "text",
+            text: `⚠️ Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`,
+          }],
+          details: {},
+        };
+      }
+
+      autoresearchMode = true;
+      updateWidget(ctx);
+
+      return {
+        content: [{
+          type: "text",
+          text: `✅ Experiment initialized: "${state.name}"\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
+        }],
+        details: { state: { ...state } },
+      };
+    },
+
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("init_experiment "));
+      text += theme.fg("accent", args.name ?? "");
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, _options, theme) {
+      const t = result.content[0];
+      return new Text(t?.type === "text" ? t.text : "", 0, 0);
+    },
+  });
+
+  // -----------------------------------------------------------------------
   // run_experiment tool
   // -----------------------------------------------------------------------
 
@@ -904,14 +984,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const secondaryMetrics = params.metrics ?? {};
 
-      // Apply config (first call only — ignored once set)
-      if (params.experiment_name && !state.name) state.name = params.experiment_name;
-      if (params.metric_name && state.metricName === "metric") state.metricName = params.metric_name;
-      if (params.metric_unit !== undefined) state.metricUnit = params.metric_unit;
-      if (params.direction === "lower" || params.direction === "higher") {
-        state.bestDirection = params.direction;
-      }
-
       // Validate secondary metrics consistency (after first experiment establishes them)
       if (state.secondaryMetrics.length > 0) {
         const knownNames = new Set(state.secondaryMetrics.map((m) => m.name));
@@ -957,17 +1029,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       try {
         const jsonlPath = path.join(ctx.cwd, "autoresearch.jsonl");
         let output = "";
-
-        // Write config header on first experiment
-        if (state.results.length === 1) {
-          output += JSON.stringify({
-            type: "config",
-            name: state.name,
-            metricName: state.metricName,
-            metricUnit: state.metricUnit,
-            bestDirection: state.bestDirection,
-          }) + "\n";
-        }
 
         output += JSON.stringify({
           run: state.results.length,
