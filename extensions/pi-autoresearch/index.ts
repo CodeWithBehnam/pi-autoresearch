@@ -239,11 +239,36 @@ function killTree(pid: number): void {
   }
 }
 
-/** Check if a command string is running autoresearch.sh (or ./autoresearch.sh) */
+/**
+ * Check if a command's primary purpose is running autoresearch.sh.
+ *
+ * Strategy: strip common harmless prefixes (env vars, env/time/nice wrappers)
+ * then check that the core command is autoresearch.sh invoked via a known
+ * pattern. Rejects chaining tricks like "evil.py; autoresearch.sh" because
+ * we require autoresearch.sh to be the *first* real command.
+ */
 function isAutoresearchShCommand(command: string): boolean {
-  const trimmed = command.trim();
-  // Match: autoresearch.sh as first token, or preceded by bash/sh/source/./ 
-  return /(?:^|&&|;|\|)\s*(?:bash\s+|sh\s+|source\s+|\.\/)?autoresearch\.sh(?:\s|$)/.test(trimmed);
+  let cmd = command.trim();
+
+  // Strip leading env variable assignments: FOO=bar BAZ="qux" ...
+  cmd = cmd.replace(/^(?:\w+=\S*\s+)+/, "");
+
+  // Strip known harmless command wrappers (env, time, nice, nohup) repeatedly
+  // Allows flags and their numeric values: e.g. "nice -n 10 time env ..."
+  let prev: string;
+  do {
+    prev = cmd;
+    cmd = cmd.replace(/^(?:env|time|nice|nohup)(?:\s+-\S+(?:\s+\d+)?)*\s+/, "");
+  } while (cmd !== prev);
+
+  // Now the core command must be autoresearch.sh via a known invocation:
+  //   autoresearch.sh
+  //   ./autoresearch.sh
+  //   /path/to/autoresearch.sh
+  //   bash [-flags] autoresearch.sh
+  //   bash [-flags] ./autoresearch.sh
+  //   bash [-flags] /path/to/autoresearch.sh
+  return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?(?:\.\/|\/[\w/.-]*\/)?autoresearch\.sh(?:\s|$)/.test(cmd);
 }
 
 function isBetter(
@@ -1252,11 +1277,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Spawn the process directly (like the bash tool) for streaming output
       const getTempFile = createTempFileAllocator();
-      const { exitCode, killed: timedOut, output, tempFilePath: streamTempFile } = await new Promise<{
+      const { exitCode, killed: timedOut, output, tempFilePath: streamTempFile, actualTotalBytes } = await new Promise<{
         exitCode: number | null;
         killed: boolean;
         output: string;
         tempFilePath: string | undefined;
+        actualTotalBytes: number;
       }>((resolve, reject) => {
         let processTimedOut = false;
 
@@ -1397,6 +1423,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             killed: processTimedOut,
             output: fullBuffer.toString("utf-8"),
             tempFilePath,
+            actualTotalBytes: totalBytes,
           });
         });
       }).finally(() => {
@@ -1442,9 +1469,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Reuse streaming temp file if it exists, otherwise create one for large output
       let fullOutputPath: string | undefined = streamTempFile;
-      const totalBytes = Buffer.byteLength(output, "utf-8");
       const totalLines = output.split("\n").length;
-      if (!fullOutputPath && (totalBytes > EXPERIMENT_MAX_BYTES || totalLines > EXPERIMENT_MAX_LINES)) {
+      if (!fullOutputPath && (actualTotalBytes > EXPERIMENT_MAX_BYTES || totalLines > EXPERIMENT_MAX_LINES)) {
         fullOutputPath = getTempFile();
         fs.writeFileSync(fullOutputPath, output);
       }
