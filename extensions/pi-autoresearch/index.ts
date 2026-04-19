@@ -111,6 +111,8 @@ interface RunDetails {
   /** Name of the primary metric (for display) */
   metricName: string;
   metricUnit: string;
+  /** Internal run id for strict run/log pairing */
+  runId?: string;
 
 }
 
@@ -218,9 +220,7 @@ function transitionMachineState(
       next = current === AutoresearchModeState.Terminal ? current : AutoresearchModeState.Running;
       break;
     case AutoresearchMachineEvent.RunBlocked:
-      next = (current === AutoresearchModeState.Idle || current === AutoresearchModeState.Terminal)
-        ? current
-        : AutoresearchModeState.SegmentReady;
+      next = current;
       break;
     case AutoresearchMachineEvent.RunCompleted:
       next = AutoresearchModeState.AwaitingLog;
@@ -1670,7 +1670,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Run a timed experiment command (captures duration, output, exit code)",
     promptGuidelines: [
       "Use run_experiment instead of bash when running experiment commands — it handles timing and output capture automatically.",
-      "After run_experiment, always call log_experiment to record the result.",
+      "After run_experiment, always call log_experiment to record the result exactly once.",
+      "Do not call run_experiment again until the previous run has been logged.",
       "If the benchmark script outputs structured METRIC lines (e.g. 'METRIC total_µs=15200'), run_experiment will parse them automatically and suggest exact values for log_experiment. Use these parsed values directly instead of extracting them manually from the output.",
 
     ],
@@ -1689,6 +1690,110 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
       const workDir = resolveWorkDir(ctx.cwd);
+
+      // Enforce run/log pairing lifecycle: one run must be logged before the next run.
+      if (runtime.modeState === AutoresearchModeState.Running) {
+        transitionMachineState(
+          runtime,
+          AutoresearchMachineEvent.RunBlocked,
+          "run requested while another run is in-flight"
+        );
+        return {
+          content: [{
+            type: "text",
+            text: `⚠️ Cannot start a new run yet.
+A benchmark is already running for run ID ${runtime.pendingRunId ?? "(none)"}. Please wait for it to finish before starting another.`,
+          }],
+          details: {
+            command: params.command,
+            exitCode: null,
+            durationSeconds: 0,
+            passed: false,
+            crashed: true,
+            timedOut: false,
+            tailOutput: "",
+            checksPass: null,
+            checksTimedOut: false,
+            checksOutput: "",
+            checksDuration: 0,
+            parsedMetrics: null,
+            parsedPrimary: null,
+            metricName: state.metricName,
+            metricUnit: state.metricUnit,
+            runId: runtime.pendingRunId ?? undefined,
+          } as RunDetails,
+        };
+      }
+
+      if (runtime.modeState === AutoresearchModeState.AwaitingLog) {
+        transitionMachineState(
+          runtime,
+          AutoresearchMachineEvent.RunBlocked,
+          "run requested while previous run is pending log"
+        );
+        return {
+          content: [{
+            type: "text",
+            text: `⚠️ Cannot start a new run yet.
+A previous run must be logged first.
+
+State: ${runtime.modeState}
+Pending run ID: ${runtime.pendingRunId ?? "(none)"}
+
+Please call log_experiment for the previous run (using the same run output context), then continue with run_experiment.`,
+          }],
+          details: {
+            command: params.command,
+            exitCode: null,
+            durationSeconds: 0,
+            passed: false,
+            crashed: true,
+            timedOut: false,
+            tailOutput: "",
+            checksPass: null,
+            checksTimedOut: false,
+            checksOutput: "",
+            checksDuration: 0,
+            parsedMetrics: null,
+            parsedPrimary: null,
+            metricName: state.metricName,
+            metricUnit: state.metricUnit,
+            runId: runtime.pendingRunId ?? undefined,
+          } as RunDetails,
+        };
+      }
+
+      if (runtime.modeState === AutoresearchModeState.Terminal) {
+        transitionMachineState(
+          runtime,
+          AutoresearchMachineEvent.RunBlocked,
+          "run requested after terminal max reached"
+        );
+        return {
+          content: [{
+            type: "text",
+            text: `🛑 Autoresearch loop reached its terminal limit. Run init_experiment to start a new segment before running again.`,
+          }],
+          details: {
+            command: params.command,
+            exitCode: null,
+            durationSeconds: 0,
+            passed: false,
+            crashed: true,
+            timedOut: false,
+            tailOutput: "",
+            checksPass: null,
+            checksTimedOut: false,
+            checksOutput: "",
+            checksDuration: 0,
+            parsedMetrics: null,
+            parsedPrimary: null,
+            metricName: state.metricName,
+            metricUnit: state.metricUnit,
+            runId: runtime.pendingRunId ?? undefined,
+          } as RunDetails,
+        };
+      }
 
       // Block if max experiments limit already reached
       if (state.maxExperiments !== null) {
@@ -2003,6 +2108,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         parsedPrimary,
         metricName: state.metricName,
         metricUnit: state.metricUnit,
+        runId: runtime.pendingRunId ?? undefined,
       };
 
       transitionMachineState(
@@ -2217,7 +2323,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     promptSnippet:
       "Log experiment result (commit, metric, status, description)",
     promptGuidelines: [
-      "Always call log_experiment after run_experiment to record the result.",
+      "Call log_experiment only after run_experiment for the matching run (strictly one-to-one).",
       "log_experiment automatically runs git add -A && git commit on 'keep', and auto-reverts code changes on 'discard'/'crash'/'checks_failed' (autoresearch files are preserved). Do NOT commit or revert manually.",
       "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. Secondary metrics are for monitoring — they almost never affect keep/discard. Only discard a primary improvement if a secondary metric degraded catastrophically, and explain why in the description.",
       "log_experiment reports a confidence score after 3+ runs (best improvement as a multiple of the noise floor). ≥2.0× = likely real, <1.0× = within noise. If confidence is below 1.0×, consider re-running the same experiment to confirm before keeping. The score is advisory — it never auto-discards.",
@@ -2240,6 +2346,39 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       const workDir = resolveWorkDir(ctx.cwd);
       const secondaryMetrics = params.metrics ?? {};
+
+      // Enforce strict run/log pairing (one run must be completed before logging).
+      if (
+        runtime.modeState !== AutoresearchModeState.AwaitingLog ||
+        !runtime.pendingRunId ||
+        !runtime.lastRunSummary ||
+        runtime.lastRunSummary.runId !== runtime.pendingRunId
+      ) {
+        transitionMachineState(
+          runtime,
+          AutoresearchMachineEvent.RunBlocked,
+          "log_experiment called without matching pending run"
+        );
+        return {
+          content: [{
+            type: "text",
+            text: `❌ Invalid log_experiment call order.
+
+log_experiment can only be called immediately after run_experiment (one-to-one).
+No matching pending run was found.
+
+Current state: ${runtime.modeState}
+Pending run ID: ${runtime.pendingRunId ?? "(none)"}
+
+Please call run_experiment first, then call log_experiment with the run result.`,
+          }],
+          details: {
+            modeState: runtime.modeState,
+            pendingRunId: runtime.pendingRunId,
+            hasRunSummary: !!runtime.lastRunSummary,
+          },
+        };
+      }
 
       // Gate: prevent "keep" when last run's checks failed
       if (params.status === "keep" && runtime.lastRunChecks && !runtime.lastRunChecks.pass) {
@@ -2287,11 +2426,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ? params.asi as ASI
         : undefined;
 
-      const runPhaseMismatch = runtime.modeState !== AutoresearchModeState.AwaitingLog;
-      const fallbackNotice = runPhaseMismatch
-        ? "\n\n⚠️ Note: log_experiment was called while not in AwaitingLog state. Applying for compatibility."
-        : "";
-
       const iterationTokens = lastIterationTokens(runtime);
 
       const experiment: ExperimentResult = {
@@ -2332,7 +2466,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Build response text
       const segmentCount = currentResults(state.results, state.currentSegment).length;
-      let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}${fallbackNotice}`;
+      let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
 
       if (state.bestMetric !== null) {
         text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
