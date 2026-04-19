@@ -27,7 +27,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type Server, type ServerResponse } from "node:http";
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -50,6 +50,85 @@ interface ASI {
   [key: string]: unknown;
 }
 
+const AUTORESEARCH_SCHEMA_VERSION = 2;
+const AUTORESEARCH_STATE_FILE = "autoresearch.jsonl";
+
+interface RunArtifactBundle {
+  runId: string;
+  command: string;
+  startedAt: number;
+  finishedAt: number;
+  durationMs: number;
+  preHead: string;
+  preBranch: string;
+  preStatus: string;
+  postStatus: string;
+  changedFiles: string[];
+  addedFiles: string[];
+  modifiedFiles: string[];
+  deletedFiles: string[];
+  untrackedFiles: string[];
+  diffStats: {
+    files: number;
+    insertions: number;
+    deletions: number;
+  };
+  artifactPath: string;
+  environment: {
+    os: string;
+    node: string;
+    platform: string;
+    cwd: string;
+    ci: boolean;
+  };
+}
+
+interface ResultConstraintViolation {
+  metric: string;
+  reason: "min" | "max";
+  expected: number | null;
+  actual: number;
+}
+
+interface ResultConstraint {
+  min?: number;
+  max?: number;
+}
+
+interface ResultObjectives {
+  /** Optional metric weights for multi-objective scoring; primary metric should be 1+ by default. */
+  metricWeights: Record<string, number>;
+  /** Optional hard constraints, e.g. compile_time_max. */
+  constraints: Record<string, ResultConstraint>;
+}
+
+interface ExperimentRunContract {
+  /** Require parsed primary metric from run_experiment output. */
+  requirePrimaryMetric: boolean;
+  /** Optional required secondary metrics to be present in METRIC output. */
+  requiredSecondaryMetrics: string[];
+}
+
+interface AutoresearchPolicy {
+  /** Regex-like patterns that are forbidden in run commands. */
+  blockedCommandPatterns: string[];
+  /** If present, command must start with one of these prefixes (unless empty => allow any). */
+  allowedCommandPrefixes: string[];
+  /** Hard limit on files changed in a successful run. */
+  maxModifiedFilesPerRun: number | null;
+  /** If true, soft violations are shown but still logged; if false, hard-block keep/accept. */
+  allowSoftViolations: boolean;
+  /** "warn" keeps running and records warning; "reject" hard-blocks the violating command. */
+  onViolation: "warn" | "reject";
+}
+
+interface AutoresearchBudget {
+  maxWallTimeSeconds: number | null;
+  maxTokenBudget: number | null;
+  stagnationWindow: number | null;
+  minStagnationRatio: number | null;
+}
+
 interface ExperimentResult {
   commit: string;
   metric: number;
@@ -64,6 +143,16 @@ interface ExperimentResult {
   confidence: number | null;
   /** Context tokens consumed during this iteration (from run_experiment to log_experiment). null if unavailable. */
   iterationTokens: number | null;
+  /** Optional strict run id for transaction safety. */
+  runId?: string;
+  /** Optional reproducibility artifacts path for this run. */
+  artifactPath?: string;
+  /** Optional pre-computed scalarized score for multi-objective support. */
+  objectiveScore?: number | null;
+  /** Optional objective violations for constraints. */
+  objectiveViolations?: ResultConstraintViolation[];
+  /** Optional structured side metadata for forensics/reproducibility. */
+  schemaVersion: number;
   /** Actionable Side Information — structured diagnostics for this run */
   asi?: ASI;
 }
@@ -89,6 +178,10 @@ interface ExperimentState {
   maxExperiments: number | null;
   /** Current session confidence score (best improvement / noise floor). null if insufficient data. */
   confidence: number | null;
+  /** Optional objective settings attached to this segment/session. */
+  objectiveWeights: Record<string, number>;
+  /** Optional objective constraints used by query and scoring logic. */
+  objectiveConstraints: Record<string, ResultConstraint>;
 }
 
 interface RunDetails {
@@ -111,15 +204,28 @@ interface RunDetails {
   /** Name of the primary metric (for display) */
   metricName: string;
   metricUnit: string;
-
+  /** Any contract enforcement issues found while parsing. */
+  metricContractViolations?: string[];
+  /** Command-policy warnings surfaced in run_experiment. */
+  policyWarnings?: string[];
+  /** Internal run id for strict run/log pairing */
+  runId?: string;
+  /** Artifact location for reproducibility bundle and diff summary. */
+  artifactPath?: string;
+  /** Snapshot id used for idempotency and forensics. */
+  runArtifact?: RunArtifactBundle;
 }
 
 interface LogDetails {
   experiment: ExperimentResult;
   state: ExperimentState;
   wallClockSeconds: number | null;
+  runArtifact?: RunArtifactBundle;
+  budgetCheck?: {
+    paused: boolean;
+    reason: string;
+  };
 }
-
 enum AutoresearchModeState {
   Idle = "idle",
   Active = "active",
@@ -174,6 +280,22 @@ interface AutoresearchRuntime {
   pendingRunId: string | null;
   /** Last captured run details, for optional ownership checks. */
   lastRunSummary: RunDetails | null;
+  /** Run ids already logged in this session (for idempotent log handling). */
+  loggedRunIds: Set<string>;
+  /** Session mode timestamp for budgets/time-based stopping. */
+  segmentStartedAt: number | null;
+  /** Session-level budget snapshot config derived from autoresearch.config.json. */
+  budgets: AutoresearchBudget;
+  /** Active safety policy for commands and file changes. */
+  policy: AutoresearchPolicy;
+  /** Active metric contract to validate outputs. */
+  metricContract: ExperimentRunContract;
+  /** If true, user requested pause due to budget/stagnation. */
+  pausedByBudget: boolean;
+  /** Last baseline snapshot for run reproducibility.
+   * not persisted, for idempotent / forensic analysis. */
+  lastRunArtifactPreState: { command: string; startedAt: number; head: string } | null;
+
 }
 
 function createMachineTrace(
@@ -218,9 +340,7 @@ function transitionMachineState(
       next = current === AutoresearchModeState.Terminal ? current : AutoresearchModeState.Running;
       break;
     case AutoresearchMachineEvent.RunBlocked:
-      next = (current === AutoresearchModeState.Idle || current === AutoresearchModeState.Terminal)
-        ? current
-        : AutoresearchModeState.SegmentReady;
+      next = current;
       break;
     case AutoresearchMachineEvent.RunCompleted:
       next = AutoresearchModeState.AwaitingLog;
@@ -254,6 +374,343 @@ function newPendingRunId(): string {
 function clearPendingRun(runtime: AutoresearchRuntime): void {
   runtime.pendingRunId = null;
   runtime.lastRunSummary = null;
+  runtime.lastRunArtifactPreState = null;
+}
+
+function safeExecGit(workDir: string, args: string[]): string {
+  try {
+    return execFileSync("git", args, {
+      cwd: workDir,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 8000,
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function gitStatusSnapshot(workDir: string): {
+  branch: string;
+  head: string;
+  status: string;
+  changedFiles: string[];
+  addedFiles: string[];
+  modifiedFiles: string[];
+  deletedFiles: string[];
+  untrackedFiles: string[];
+  numstat: { files: number; insertions: number; deletions: number };
+} {
+  const branch = safeExecGit(workDir, ["rev-parse", "--abbrev-ref", "HEAD"]) || "(detached)";
+  const head = safeExecGit(workDir, ["rev-parse", "HEAD"]) || "(unknown)";
+  const status = safeExecGit(workDir, ["status", "--short"]) || "";
+
+  const changedFiles: string[] = [];
+  const added: string[] = [];
+  const modified: string[] = [];
+  const deleted: string[] = [];
+  const untracked: string[] = [];
+
+  for (const raw of status.split("\n").map((l) => l.trim()).filter(Boolean)) {
+    if (raw.length < 3) continue;
+    const file = raw.slice(3).trim();
+    if (!file) continue;
+    const code = raw.slice(0, 2);
+    changedFiles.push(file);
+
+    if (code === "??") {
+      untracked.push(file);
+      continue;
+    }
+
+    if (code.includes("D") || code[1] === "D") {
+      deleted.push(file);
+      continue;
+    }
+
+    if (code.includes("A") || code[0] === "A") {
+      added.push(file);
+      continue;
+    }
+
+    if (code.includes("M") || code[0] === "M" || code[1] === "M") {
+      modified.push(file);
+      continue;
+    }
+  }
+
+  const numstatRaw = safeExecGit(workDir, ["diff", "--numstat"]);
+  let insertions = 0;
+  let deletions = 0;
+  let files = 0;
+  for (const line of numstatRaw.split("\n").map((l) => l.trim()).filter(Boolean)) {
+    const [ins, del] = line.split("\t");
+    if (!ins || !del) continue;
+    const insN = Number(ins);
+    const delN = Number(del);
+    if (Number.isFinite(insN) && Number.isFinite(delN)) {
+      files++;
+      insertions += insN;
+      deletions += delN;
+    }
+  }
+
+  return {
+    branch,
+    head,
+    status,
+    changedFiles: Array.from(new Set(changedFiles)),
+    addedFiles: Array.from(new Set(added)),
+    modifiedFiles: Array.from(new Set(modified)),
+    deletedFiles: Array.from(new Set(deleted)),
+    untrackedFiles: Array.from(new Set(untracked)),
+    numstat: { files, insertions, deletions },
+  };
+}
+
+function createRunArtifactBundle(
+  runId: string,
+  command: string,
+  workDir: string,
+  startedAt: number,
+  finishedAt: number,
+  preSnapshot: ReturnType<typeof gitStatusSnapshot>,
+  postSnapshot: ReturnType<typeof gitStatusSnapshot>
+): RunArtifactBundle {
+  const preSet = new Set(preSnapshot.changedFiles);
+  const addedByRun = postSnapshot.addedFiles.filter((file) => !preSet.has(file));
+  const modifiedByRun = postSnapshot.modifiedFiles.filter((file) => !preSet.has(file));
+  const deletedByRun = postSnapshot.deletedFiles.filter((file) => !preSet.has(file));
+  const untrackedByRun = postSnapshot.untrackedFiles.filter((file) => !preSet.has(file));
+
+  const runChangedFiles = Array.from(new Set([
+    ...addedByRun,
+    ...modifiedByRun,
+    ...deletedByRun,
+    ...untrackedByRun,
+  ]));
+
+  return {
+    runId,
+    command,
+    startedAt,
+    finishedAt,
+    durationMs: Math.max(0, finishedAt - startedAt),
+    preHead: preSnapshot.head,
+    preBranch: preSnapshot.branch,
+    preStatus: preSnapshot.status,
+    postStatus: postSnapshot.status,
+    changedFiles: runChangedFiles,
+    addedFiles: addedByRun,
+    modifiedFiles: modifiedByRun,
+    deletedFiles: deletedByRun,
+    untrackedFiles: untrackedByRun,
+    diffStats: {
+      files: Math.max(preSnapshot.numstat.files, postSnapshot.numstat.files),
+      insertions: Math.max(preSnapshot.numstat.insertions, postSnapshot.numstat.insertions),
+      deletions: Math.max(preSnapshot.numstat.deletions, postSnapshot.numstat.deletions),
+    },
+    artifactPath: "",
+    environment: {
+      os: process.platform,
+      node: process.version,
+      platform: process.platform,
+      cwd: workDir,
+      ci: process.env.CI === "1" || process.env.CI?.toLowerCase() === "true",
+    },
+  };
+}
+
+function writeRunArtifact(bundle: RunArtifactBundle, runId: string): string {
+  const artifactsDir = path.join(tmpdir(), "pi-autoresearch-artifacts");
+  const artifactPath = path.join(artifactsDir, `${runId}.json`);
+  try {
+    fs.mkdirSync(artifactsDir, { recursive: true });
+    fs.writeFileSync(artifactPath, JSON.stringify(bundle, null, 2), "utf-8");
+  } catch {
+    return "";
+  }
+  return artifactPath;
+}
+
+function evaluateCommandPolicy(
+  command: string,
+  policy: AutoresearchPolicy
+): { blocked: boolean; warning?: string } {
+  const trimmed = command.trim();
+
+  if (policy.allowedCommandPrefixes.length > 0) {
+    const hasAllowed = policy.allowedCommandPrefixes.some((prefix) => typeof prefix === "string" && trimmed.startsWith(prefix));
+    if (!hasAllowed) {
+      const reason = `command does not match allowed prefixes (${policy.allowedCommandPrefixes.join(", ")})`;
+      return {
+        blocked: policy.onViolation === "reject",
+        warning: reason,
+      };
+    }
+  }
+
+  for (const pattern of policy.blockedCommandPatterns) {
+    if (typeof pattern !== "string") continue;
+    try {
+      const re = new RegExp(pattern);
+      if (re.test(trimmed)) {
+        return {
+          blocked: policy.onViolation === "reject",
+          warning: `command matches blocked pattern: ${pattern}`,
+        };
+      }
+    } catch {
+      // ignore malformed regex in config
+    }
+  }
+
+  return {
+    blocked: false,
+  };
+}
+
+function evaluateMetricContract(
+  metricName: string,
+  parsedPrimary: number | null,
+  parsedMetrics: Record<string, number> | null,
+  contract: ExperimentRunContract
+): string[] {
+  const violations: string[] = [];
+
+  if (contract.requirePrimaryMetric && parsedPrimary === null) {
+    violations.push(`Missing required primary metric \"${metricName}\"`);
+  }
+
+  for (const metric of contract.requiredSecondaryMetrics) {
+    if (!parsedMetrics || !(metric in parsedMetrics)) {
+      violations.push(`Missing required metric \"${metric}\"`);
+    }
+  }
+
+  return violations;
+}
+
+function evaluateBudgetLimits(runtime: AutoresearchRuntime): { blocked: boolean; reason?: string } {
+  const { maxWallTimeSeconds, maxTokenBudget, stagnationWindow, minStagnationRatio } = runtime.budgets;
+
+  if (maxWallTimeSeconds !== null) {
+    const segmentStart = runtime.segmentStartedAt;
+    if (segmentStart !== null) {
+      const elapsedSeconds = Math.floor((Date.now() - segmentStart) / 1000);
+      if (elapsedSeconds > maxWallTimeSeconds) {
+        return {
+          blocked: true,
+          reason: `segment wall-clock budget reached: ${elapsedSeconds}s > ${maxWallTimeSeconds}s`,
+        };
+      }
+    }
+  }
+
+  if (maxTokenBudget !== null) {
+    const projected = runtime.iterationTokenHistory.reduce((sum, value) => sum + value, 0);
+    if (projected >= maxTokenBudget) {
+      return {
+        blocked: true,
+        reason: `token budget reached: ${projected} ≥ ${maxTokenBudget}`,
+      };
+    }
+  }
+
+  if (stagnationWindow !== null && minStagnationRatio !== null && runtime.state.results.length > 0) {
+    const segment = currentResults(runtime.state.results, runtime.state.currentSegment);
+    const window = segment.slice(Math.max(0, segment.length - stagnationWindow));
+
+    if (window.length >= Math.max(3, stagnationWindow)) {
+      const keeps = window.filter((run) => run.status === "keep" && run.metric > 0);
+      if (keeps.length >= 1) {
+        const baseline = findBaselineMetric(runtime.state.results, runtime.state.currentSegment);
+        if (baseline !== null && baseline !== 0) {
+          const bestInWindow = keeps.reduce(
+            (best, run) => isBetter(run.metric, best, runtime.state.bestDirection) ? run.metric : best,
+            keeps[0].metric
+          );
+          const improvement = runtime.state.bestDirection === "lower"
+            ? (baseline - bestInWindow) / baseline
+            : (bestInWindow - baseline) / baseline;
+
+          if (improvement >= 0 && improvement < minStagnationRatio) {
+            return {
+              blocked: true,
+              reason: `stagnation window (${stagnationWindow}) no meaningful progress: ${(improvement * 100).toFixed(2)}% < ${(minStagnationRatio * 100).toFixed(2)}%`,
+            };
+          }
+        }
+      }
+    }
+  }
+
+  return { blocked: false };
+}
+
+function evaluateObjectives(
+  state: ExperimentState,
+  metric: number,
+  metrics: Record<string, number>,
+): {
+  score: number | null;
+  violations: ResultConstraintViolation[];
+} {
+  const weights = state.objectiveWeights ?? {};
+  const constraints = state.objectiveConstraints ?? {};
+
+  const activeWeights: Record<string, number> = {
+    [state.metricName]: 1,
+    ...weights,
+  };
+
+  const violations: ResultConstraintViolation[] = [];
+
+  const entries = Object.entries(constraints);
+  if (entries.length > 0) {
+    const resolveMetric = (name: string): number | undefined => {
+      if (name === state.metricName) return metric;
+      return metrics[name];
+    };
+
+    for (const [metricName, constraint] of entries) {
+      const value = resolveMetric(metricName);
+      if (value === undefined || !Number.isFinite(value)) continue;
+      if (constraint.min !== undefined && value < constraint.min) {
+        violations.push({ metric: metricName, reason: "min", expected: constraint.min, actual: value });
+      }
+      if (constraint.max !== undefined && value > constraint.max) {
+        violations.push({ metric: metricName, reason: "max", expected: constraint.max, actual: value });
+      }
+    }
+  }
+
+  let score = null as number | null;
+  const allMetrics: Record<string, number> = {
+    ...metrics,
+    [state.metricName]: metric,
+  };
+
+  for (const [name, rawWeight] of Object.entries(activeWeights)) {
+    const raw = allMetrics[name];
+    if (!Number.isFinite(raw)) continue;
+
+    const weight = Number(rawWeight);
+    if (!Number.isFinite(weight)) continue;
+
+    const signed = name === state.metricName && state.bestDirection === "lower"
+      ? -raw
+      : raw;
+
+    score = (score ?? 0) + signed * weight;
+  }
+
+  return { score, violations };
+}
+
+function shortCommit(input: string): string {
+  const trimmed = input.trim();
+  return trimmed.length >= 7 ? trimmed.slice(0, 7) : trimmed;
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +961,6 @@ function lastIterationTokens(runtime: AutoresearchRuntime): number | null {
 function advanceIterationTracking(runtime: AutoresearchRuntime, ctx: ExtensionContext): void {
   const usage = ctx.getContextUsage();
   if (usage?.tokens == null) return;
-  recordIterationTokens(runtime, usage.tokens);
   runtime.iterationStartTokens = usage.tokens;
 }
 
@@ -575,6 +1031,71 @@ function currentResults(results: ExperimentResult[], segment: number): Experimen
 interface AutoresearchConfig {
   maxIterations?: number;
   workingDir?: string;
+  metricContract?: {
+    requirePrimaryMetric?: boolean;
+    requiredSecondaryMetrics?: string[];
+  };
+  objectives?: {
+    metricWeights?: Record<string, number>;
+    constraints?: Record<string, ResultConstraint>;
+  };
+  policy?: {
+    blockedCommandPatterns?: string[];
+    allowedCommandPrefixes?: string[];
+    maxModifiedFilesPerRun?: number;
+    allowSoftViolations?: boolean;
+    onViolation?: "warn" | "reject";
+  };
+  budgets?: {
+    maxWallTimeSeconds?: number;
+    maxTokenBudget?: number;
+    stagnationWindow?: number;
+    minStagnationRatio?: number;
+  };
+}
+
+const DEFAULT_DENIED_COMMAND_PATTERNS = [
+  "\\brm\\s+-rf\\s+/",
+  "\\brm\\s+-rf\\s+(?:$|[\"'])?/$",
+  "\\bmkfs\\b",
+  "\\bdd\\s+if=",
+  "\\bformat\\b",
+  "\\bsudo\\s+chmod\\s+-R\\s+777\\b",
+];
+
+const DEFAULT_ALLOWED_PREFIXES: string[] = [];
+
+function defaultAutoresearchPolicy(): AutoresearchPolicy {
+  return {
+    blockedCommandPatterns: [...DEFAULT_DENIED_COMMAND_PATTERNS],
+    allowedCommandPrefixes: [...DEFAULT_ALLOWED_PREFIXES],
+    maxModifiedFilesPerRun: null,
+    allowSoftViolations: true,
+    onViolation: "reject",
+  };
+}
+
+function defaultAutoresearchBudgets(): AutoresearchBudget {
+  return {
+    maxWallTimeSeconds: null,
+    maxTokenBudget: null,
+    stagnationWindow: null,
+    minStagnationRatio: null,
+  };
+}
+
+function defaultMetricContract(): ExperimentRunContract {
+  return {
+    requirePrimaryMetric: false,
+    requiredSecondaryMetrics: [],
+  };
+}
+
+function defaultResultObjectives(): ResultObjectives {
+  return {
+    metricWeights: {},
+    constraints: {},
+  };
 }
 
 /** Read autoresearch.config.json from the given directory (always ctx.cwd) */
@@ -582,10 +1103,118 @@ function readConfig(cwd: string): AutoresearchConfig {
   try {
     const configPath = path.join(cwd, "autoresearch.config.json");
     if (!fs.existsSync(configPath)) return {};
-    return JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    return typeof parsed === "object" && parsed !== null ? parsed as AutoresearchConfig : {};
   } catch {
     return {};
   }
+}
+
+function readMetricContract(cwd: string): ExperimentRunContract {
+  const config = readConfig(cwd);
+  const contract = config.metricContract ?? {};
+  return {
+    requirePrimaryMetric: contract.requirePrimaryMetric === true,
+    requiredSecondaryMetrics: Array.isArray(contract.requiredSecondaryMetrics)
+      ? contract.requiredSecondaryMetrics
+      : [],
+  };
+}
+
+function readObjectives(cwd: string): ResultObjectives {
+  const config = readConfig(cwd);
+  const objectiveConfig = config.objectives ?? {};
+
+  const metricWeights: Record<string, number> = {};
+  if (typeof objectiveConfig.metricWeights === "object" && objectiveConfig.metricWeights) {
+    for (const [name, value] of Object.entries(objectiveConfig.metricWeights)) {
+      const asNum = Number(value);
+      if (Number.isFinite(asNum)) {
+        metricWeights[name] = asNum;
+      }
+    }
+  }
+
+  const constraints: Record<string, ResultConstraint> = {};
+  if (typeof objectiveConfig.constraints === "object" && objectiveConfig.constraints) {
+    for (const [name, raw] of Object.entries(objectiveConfig.constraints)) {
+      if (!raw || typeof raw !== "object") continue;
+      const constraint = raw as Record<string, unknown>;
+      const next: ResultConstraint = {};
+
+      const rawMin = Number(constraint.min);
+      const rawMax = Number(constraint.max);
+      if (Number.isFinite(rawMin)) {
+        next.min = rawMin;
+      }
+      if (Number.isFinite(rawMax)) {
+        next.max = rawMax;
+      }
+
+      if (next.min !== undefined || next.max !== undefined) {
+        constraints[name] = next;
+      }
+    }
+  }
+
+  return {
+    metricWeights,
+    constraints,
+  };
+}
+
+function readPolicy(cwd: string): AutoresearchPolicy {
+  const config = readConfig(cwd);
+  const policy = config.policy ?? {};
+  const blockedPatterns = Array.isArray(policy.blockedCommandPatterns)
+    ? policy.blockedCommandPatterns.filter((value): value is string => typeof value === "string")
+    : defaultAutoresearchPolicy().blockedCommandPatterns;
+  const allowedPrefixes = Array.isArray(policy.allowedCommandPrefixes)
+    ? policy.allowedCommandPrefixes.filter((value): value is string => typeof value === "string")
+    : defaultAutoresearchPolicy().allowedCommandPrefixes;
+
+  return {
+    blockedCommandPatterns: blockedPatterns,
+    allowedCommandPrefixes: allowedPrefixes,
+    maxModifiedFilesPerRun: typeof policy.maxModifiedFilesPerRun === "number" && policy.maxModifiedFilesPerRun > 0
+      ? Math.floor(policy.maxModifiedFilesPerRun)
+      : null,
+    allowSoftViolations: policy.allowSoftViolations !== false,
+    onViolation: policy.onViolation === "warn" ? "warn" : "reject",
+  };
+}
+
+function readBudgets(cwd: string): AutoresearchBudget {
+  const config = readConfig(cwd);
+  const budget = config.budgets ?? {};
+  const defaults = defaultAutoresearchBudgets();
+  return {
+    maxWallTimeSeconds: typeof budget.maxWallTimeSeconds === "number" && Number.isFinite(budget.maxWallTimeSeconds) && budget.maxWallTimeSeconds > 0
+      ? Math.floor(budget.maxWallTimeSeconds)
+      : defaults.maxWallTimeSeconds,
+    maxTokenBudget: typeof budget.maxTokenBudget === "number" && Number.isFinite(budget.maxTokenBudget) && budget.maxTokenBudget > 0
+      ? Math.floor(budget.maxTokenBudget)
+      : defaults.maxTokenBudget,
+    stagnationWindow: typeof budget.stagnationWindow === "number" && Number.isFinite(budget.stagnationWindow) && budget.stagnationWindow > 2
+      ? Math.floor(budget.stagnationWindow)
+      : defaults.stagnationWindow,
+    minStagnationRatio: typeof budget.minStagnationRatio === "number" && Number.isFinite(budget.minStagnationRatio) && budget.minStagnationRatio > 0
+      ? budget.minStagnationRatio
+      : defaults.minStagnationRatio,
+  };
+}
+
+function refreshRuntimeConfig(runtime: AutoresearchRuntime, cwd: string): void {
+  const policy = readPolicy(cwd);
+  const objectiveConfig = readObjectives(cwd);
+  const budgets = readBudgets(cwd);
+  const contract = readMetricContract(cwd);
+
+  runtime.policy = policy;
+  runtime.budgets = budgets;
+  runtime.metricContract = contract;
+  runtime.state.objectiveWeights = objectiveConfig.metricWeights;
+  runtime.state.objectiveConstraints = objectiveConfig.constraints;
 }
 
 /** Read maxExperiments from autoresearch.config.json (if it exists) */
@@ -679,6 +1308,8 @@ function cloneExperimentState(state: ExperimentState): ExperimentState {
       metrics: { ...result.metrics },
     })),
     secondaryMetrics: state.secondaryMetrics.map((metric) => ({ ...metric })),
+    objectiveWeights: { ...state.objectiveWeights },
+    objectiveConstraints: { ...state.objectiveConstraints },
   };
 }
 
@@ -747,6 +1378,8 @@ function createExperimentState(): ExperimentState {
     currentSegment: 0,
     maxExperiments: null,
     confidence: null,
+    objectiveWeights: {},
+    objectiveConstraints: {},
   };
 }
 
@@ -767,6 +1400,13 @@ function createSessionRuntime(): AutoresearchRuntime {
     lastMachineTrace: null,
     pendingRunId: null,
     lastRunSummary: null,
+    loggedRunIds: new Set(),
+    segmentStartedAt: null,
+    budgets: defaultAutoresearchBudgets(),
+    policy: defaultAutoresearchPolicy(),
+    metricContract: defaultMetricContract(),
+    pausedByBudget: false,
+    lastRunArtifactPreState: null,
   };
 }
 
@@ -1160,11 +1800,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtime.lastRunDuration = null;
     runtime.runningExperiment = null;
     clearPendingRun(runtime);
+    refreshRuntimeConfig(runtime, ctx.cwd);
     runtime.lastAutoResumeTime = 0;
     runtime.experimentsThisSession = 0;
     runtime.autoResumeTurns = 0;
     runtime.iterationStartTokens = null;
     runtime.iterationTokenHistory = [];
+    runtime.loggedRunIds = new Set();
+    runtime.segmentStartedAt = null;
+    runtime.lastRunArtifactPreState = null;
+    runtime.pausedByBudget = false;
     runtime.state = createExperimentState();
 
     let state = runtime.state;
@@ -1173,7 +1818,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const workDir = resolveWorkDir(ctx.cwd);
 
     // Primary: read from autoresearch.jsonl (alongside autoresearch.md/sh)
-    const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+    const jsonlPath = path.join(workDir, AUTORESEARCH_STATE_FILE);
     let loadedFromJsonl = false;
     try {
       if (fs.existsSync(jsonlPath)) {
@@ -1201,7 +1846,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
             // Experiment result line
             const iterationTokens = entry.iterationTokens ?? null;
-            state.results.push({
+            const schemaVersion =
+              typeof entry.schemaVersion === "number" && Number.isFinite(entry.schemaVersion)
+                ? entry.schemaVersion
+                : 1;
+
+            const parsedExperiment: ExperimentResult = {
               commit: entry.commit ?? "",
               metric: entry.metric ?? 0,
               metrics: entry.metrics ?? {},
@@ -1212,14 +1862,36 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               confidence: entry.confidence ?? null,
               iterationTokens,
               asi: entry.asi ?? undefined,
-            });
+              schemaVersion,
+            };
+
+            if (typeof entry.runId === "string") {
+              parsedExperiment.runId = entry.runId;
+              if (!runtime.loggedRunIds.has(entry.runId)) {
+                runtime.loggedRunIds.add(entry.runId);
+              }
+            }
+
+            if (typeof entry.artifactPath === "string") {
+              parsedExperiment.artifactPath = entry.artifactPath;
+            }
+
+            if (typeof entry.objectiveScore === "number") {
+              parsedExperiment.objectiveScore = entry.objectiveScore;
+            }
+
+            if (Array.isArray(entry.objectiveViolations)) {
+              parsedExperiment.objectiveViolations = entry.objectiveViolations;
+            }
+
+            state.results.push(parsedExperiment);
 
             if (typeof iterationTokens === "number" && iterationTokens > 0) {
               runtime.iterationTokenHistory.push(iterationTokens);
             }
 
             // Register secondary metrics
-            for (const name of Object.keys(entry.metrics ?? {})) {
+            for (const name of Object.keys(parsedExperiment.metrics ?? {})) {
               if (!state.secondaryMetrics.find((m) => m.name === name)) {
                 let unit = "";
                 if (name.endsWith("µs")) unit = "µs";
@@ -1238,6 +1910,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           loadedFromJsonl = true;
           state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
           state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
+
+          const segmentRuns = currentResults(state.results, state.currentSegment);
+          const firstSegmentRun = segmentRuns[0];
+          runtime.segmentStartedAt = firstSegmentRun ? firstSegmentRun.timestamp : Date.now();
+          runtime.state.objectiveWeights = runtime.state.objectiveWeights || {};
+          runtime.state.objectiveConstraints = runtime.state.objectiveConstraints || {};
+
+          // Load objective settings from config as defaults; existing logs do not include them.
+          const objectiveConfig = readObjectives(ctx.cwd);
+          if (Object.keys(runtime.state.objectiveWeights).length === 0) {
+            runtime.state.objectiveWeights = objectiveConfig.metricWeights;
+          }
+          if (Object.keys(runtime.state.objectiveConstraints).length === 0) {
+            runtime.state.objectiveConstraints = objectiveConfig.constraints;
+          }
         }
       }
     } catch {
@@ -1262,10 +1949,25 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           for (const r of state.results) {
             if (!r.metrics) r.metrics = {};
             if (r.confidence === undefined) r.confidence = null;
+            if (!r.schemaVersion) r.schemaVersion = 1;
           }
           if (state.confidence === undefined) {
             state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
           }
+          const objectiveConfig = readObjectives(ctx.cwd);
+          if (Object.keys(state.objectiveWeights).length === 0) {
+            state.objectiveWeights = objectiveConfig.metricWeights;
+          }
+          if (Object.keys(state.objectiveConstraints).length === 0) {
+            state.objectiveConstraints = objectiveConfig.constraints;
+          }
+          runtime.state = cloneExperimentState(state);
+          const segmentRuns = currentResults(state.results, state.currentSegment);
+          const firstSegmentRun = segmentRuns[0];
+          runtime.segmentStartedAt = firstSegmentRun ? firstSegmentRun.timestamp : Date.now();
+          runtime.loggedRunIds = new Set(state.results
+            .map((r) => r.runId)
+            .filter((id): id is string => Boolean(id)));
         }
       }
     }
@@ -1275,7 +1977,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     state.maxExperiments = readMaxExperiments(ctx.cwd);
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists
-    runtime.autoresearchMode = fs.existsSync(path.join(workDir, "autoresearch.jsonl"));
+    runtime.autoresearchMode = fs.existsSync(path.join(workDir, AUTORESEARCH_STATE_FILE));
 
     // Drive machine state from reconstructed persistence
     transitionMachineState(
@@ -1570,6 +2272,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
+      refreshRuntimeConfig(runtime, ctx.cwd);
 
       // Validate working directory exists
       const workDirError = validateWorkDir(ctx.cwd);
@@ -1596,6 +2299,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       state.bestMetric = null;
       state.secondaryMetrics = [];
       state.confidence = null;
+      runtime.segmentStartedAt = Date.now();
+      runtime.pausedByBudget = false;
 
       // Read max experiments from config file (config always in ctx.cwd)
       state.maxExperiments = readMaxExperiments(ctx.cwd);
@@ -1603,7 +2308,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Write config header to jsonl (append for re-init, create for first)
       const workDir = resolveWorkDir(ctx.cwd);
       try {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+        const jsonlPath = path.join(workDir, AUTORESEARCH_STATE_FILE);
         const config = JSON.stringify({
           type: "config",
           name: state.name,
@@ -1670,7 +2375,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Run a timed experiment command (captures duration, output, exit code)",
     promptGuidelines: [
       "Use run_experiment instead of bash when running experiment commands — it handles timing and output capture automatically.",
-      "After run_experiment, always call log_experiment to record the result.",
+      "After run_experiment, always call log_experiment to record the result exactly once.",
+      "Do not call run_experiment again until the previous run has been logged.",
       "If the benchmark script outputs structured METRIC lines (e.g. 'METRIC total_µs=15200'), run_experiment will parse them automatically and suggest exact values for log_experiment. Use these parsed values directly instead of extracting them manually from the output.",
 
     ],
@@ -1679,6 +2385,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
+
+      refreshRuntimeConfig(runtime, ctx.cwd);
 
       // Validate working directory exists
       const workDirError = validateWorkDir(ctx.cwd);
@@ -1689,6 +2397,143 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
       const workDir = resolveWorkDir(ctx.cwd);
+
+      if (runtime.segmentStartedAt === null) {
+        runtime.segmentStartedAt = Date.now();
+      }
+
+      if (runtime.pausedByBudget) {
+        return {
+          content: [{
+            type: "text",
+            text: `🛑 Autoresearch is paused by budget constraints. Re-run init_experiment to start a new segment before continuing.`,
+          }],
+          details: {
+            command: params.command,
+            exitCode: null,
+            durationSeconds: 0,
+            passed: false,
+            crashed: true,
+            timedOut: false,
+            tailOutput: "",
+            checksPass: null,
+            checksTimedOut: false,
+            checksOutput: "",
+            checksDuration: 0,
+            parsedMetrics: null,
+            parsedPrimary: null,
+            metricName: state.metricName,
+            metricUnit: state.metricUnit,
+            metricContractViolations: [],
+            policyWarnings: [],
+            runId: runtime.pendingRunId ?? undefined,
+          } as RunDetails,
+        };
+      }
+
+      // Enforce run/log pairing lifecycle: one run must be logged before the next run.
+      if (runtime.modeState === AutoresearchModeState.Running) {
+        transitionMachineState(
+          runtime,
+          AutoresearchMachineEvent.RunBlocked,
+          "run requested while another run is in-flight"
+        );
+        return {
+          content: [{
+            type: "text",
+            text: `⚠️ Cannot start a new run yet.
+A benchmark is already running for run ID ${runtime.pendingRunId ?? "(none)"}. Please wait for it to finish before starting another.`,
+          }],
+          details: {
+            command: params.command,
+            exitCode: null,
+            durationSeconds: 0,
+            passed: false,
+            crashed: true,
+            timedOut: false,
+            tailOutput: "",
+            checksPass: null,
+            checksTimedOut: false,
+            checksOutput: "",
+            checksDuration: 0,
+            parsedMetrics: null,
+            parsedPrimary: null,
+            metricName: state.metricName,
+            metricUnit: state.metricUnit,
+            runId: runtime.pendingRunId ?? undefined,
+          } as RunDetails,
+        };
+      }
+
+      if (runtime.modeState === AutoresearchModeState.AwaitingLog) {
+        transitionMachineState(
+          runtime,
+          AutoresearchMachineEvent.RunBlocked,
+          "run requested while previous run is pending log"
+        );
+        return {
+          content: [{
+            type: "text",
+            text: `⚠️ Cannot start a new run yet.
+A previous run must be logged first.
+
+State: ${runtime.modeState}
+Pending run ID: ${runtime.pendingRunId ?? "(none)"}
+
+Please call log_experiment for the previous run (using the same run output context), then continue with run_experiment.`,
+          }],
+          details: {
+            command: params.command,
+            exitCode: null,
+            durationSeconds: 0,
+            passed: false,
+            crashed: true,
+            timedOut: false,
+            tailOutput: "",
+            checksPass: null,
+            checksTimedOut: false,
+            checksOutput: "",
+            checksDuration: 0,
+            parsedMetrics: null,
+            parsedPrimary: null,
+            metricName: state.metricName,
+            metricUnit: state.metricUnit,
+            runId: runtime.pendingRunId ?? undefined,
+          } as RunDetails,
+        };
+      }
+
+      if (runtime.modeState === AutoresearchModeState.Terminal) {
+        transitionMachineState(
+          runtime,
+          AutoresearchMachineEvent.RunBlocked,
+          "run requested after terminal max reached"
+        );
+        return {
+          content: [{
+            type: "text",
+            text: `🛑 Autoresearch loop reached its terminal limit. Run init_experiment to start a new segment before running again.`,
+          }],
+          details: {
+            command: params.command,
+            exitCode: null,
+            durationSeconds: 0,
+            passed: false,
+            crashed: true,
+            timedOut: false,
+            tailOutput: "",
+            checksPass: null,
+            checksTimedOut: false,
+            checksOutput: "",
+            checksDuration: 0,
+            parsedMetrics: null,
+            parsedPrimary: null,
+            metricName: state.metricName,
+            metricUnit: state.metricUnit,
+            runId: runtime.pendingRunId ?? undefined,
+          } as RunDetails,
+        };
+      }
 
       // Block if max experiments limit already reached
       if (state.maxExperiments !== null) {
@@ -1703,7 +2548,79 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
+      // Guard budgets configured in autoresearch.config.json
+      const budget = evaluateBudgetLimits(runtime);
+      if (budget.blocked) {
+        runtime.pausedByBudget = true;
+        runtime.autoresearchMode = false;
+        transitionMachineState(runtime, AutoresearchMachineEvent.MaxReached, budget.reason ?? "budget reached");
+        return {
+          content: [{
+            type: "text",
+            text: `🛑 Budget reached: ${budget.reason}. Autoresearch paused. Re-run init_experiment to start a new segment or relax budgets in autoresearch.config.json.`,
+          }],
+          details: {
+            command: params.command,
+            exitCode: null,
+            durationSeconds: 0,
+            passed: false,
+            crashed: true,
+            timedOut: false,
+            tailOutput: "",
+            checksPass: null,
+            checksTimedOut: false,
+            checksOutput: "",
+            checksDuration: 0,
+            parsedMetrics: null,
+            parsedPrimary: null,
+            metricName: state.metricName,
+            metricUnit: state.metricUnit,
+            metricContractViolations: [],
+            policyWarnings: [],
+            runId: runtime.pendingRunId ?? undefined,
+          } as RunDetails,
+        };
+      }
+
       const timeout = (params.timeout_seconds ?? 600) * 1000;
+
+      // Guard: command policy checks from config
+      const policyCheck = evaluateCommandPolicy(params.command, runtime.policy);
+      const policyWarnings = policyCheck.warning ? [policyCheck.warning] : [];
+      if (policyCheck.blocked) {
+        transitionMachineState(
+          runtime,
+          AutoresearchMachineEvent.RunBlocked,
+          "command policy violation"
+        );
+        clearPendingRun(runtime);
+        return {
+          content: [{
+            type: "text",
+            text: `❌ command blocked by autoresearch policy: ${policyCheck.warning}`,
+          }],
+          details: {
+            command: params.command,
+            exitCode: null,
+            durationSeconds: 0,
+            passed: false,
+            crashed: true,
+            timedOut: false,
+            tailOutput: "",
+            checksPass: null,
+            checksTimedOut: false,
+            checksOutput: "",
+            checksDuration: 0,
+            parsedMetrics: null,
+            parsedPrimary: null,
+            metricName: state.metricName,
+            metricUnit: state.metricUnit,
+            metricContractViolations: [],
+            policyWarnings,
+            runId: runtime.pendingRunId ?? undefined,
+          } as RunDetails,
+        };
+      }
 
       // Guard: if autoresearch.sh exists, only allow running it
       const autoresearchShPath = path.join(workDir, "autoresearch.sh");
@@ -1731,9 +2648,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             checksTimedOut: false,
             checksOutput: "",
             checksDuration: 0,
+            parsedMetrics: null,
+            parsedPrimary: null,
+            metricName: state.metricName,
+            metricUnit: state.metricUnit,
+            metricContractViolations: [],
+            policyWarnings: ["autoresearch.sh exists"],
+            runId: runtime.pendingRunId ?? undefined,
           } as RunDetails,
         };
       }
+
+      const preRunSnapshot = gitStatusSnapshot(workDir);
+      runtime.lastRunArtifactPreState = {
+        command: params.command,
+        startedAt: Date.now(),
+        head: preRunSnapshot.head,
+      };
 
       advanceIterationTracking(runtime, ctx);
       if (isContextExhausted(runtime, ctx)) {
@@ -1987,6 +2918,29 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         : null;
       const parsedPrimary = parsedMetricMap.get(state.metricName) ?? null;
 
+      const metricContractViolations = evaluateMetricContract(
+        state.metricName,
+        parsedPrimary,
+        parsedMetrics,
+        runtime.metricContract
+      );
+
+      const postRunSnapshot = gitStatusSnapshot(workDir);
+      const runId = runtime.pendingRunId ?? newPendingRunId();
+      const artifact = createRunArtifactBundle(
+        runId,
+        params.command,
+        workDir,
+        runtime.lastRunArtifactPreState?.startedAt ?? Date.now(),
+        Date.now(),
+        preRunSnapshot,
+        postRunSnapshot
+      );
+      const artifactPath = writeRunArtifact(artifact, runId);
+      if (artifactPath) {
+        artifact.artifactPath = artifactPath;
+      }
+
       const details: RunDetails = {
         command: params.command,
         exitCode,
@@ -2003,6 +2957,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         parsedPrimary,
         metricName: state.metricName,
         metricUnit: state.metricUnit,
+        metricContractViolations,
+        policyWarnings,
+        runId,
+        artifactPath: artifactPath || undefined,
+        runArtifact: artifact,
       };
 
       transitionMachineState(
@@ -2055,6 +3014,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
         // Machine-ready values for log_experiment (raw numbers, not formatted)
         text += `\nUse these values directly in log_experiment (metric: ${parsedPrimary ?? "?"}, metrics: {${secondary.map(([k, v]) => `"${k}": ${v}`).join(", ")}})\n`;
+      }
+
+      if (details.metricContractViolations.length > 0) {
+        text += `\n⚠️ Metric contract violations: ${details.metricContractViolations.join("; ")}`;
+      }
+
+      if (details.policyWarnings.length > 0) {
+        text += `\n⚠️ Policy warnings: ${details.policyWarnings.join("; ")}`;
+      }
+
+      if (artifactPath) {
+        text += `\n🧾 Reproducibility artifact: ${artifactPath}`;
       }
 
       text += `\n${llmTruncation.content}`;
@@ -2217,7 +3188,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     promptSnippet:
       "Log experiment result (commit, metric, status, description)",
     promptGuidelines: [
-      "Always call log_experiment after run_experiment to record the result.",
+      "Call log_experiment only after run_experiment for the matching run (strictly one-to-one).",
       "log_experiment automatically runs git add -A && git commit on 'keep', and auto-reverts code changes on 'discard'/'crash'/'checks_failed' (autoresearch files are preserved). Do NOT commit or revert manually.",
       "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. Secondary metrics are for monitoring — they almost never affect keep/discard. Only discard a primary improvement if a secondary metric degraded catastrophically, and explain why in the description.",
       "log_experiment reports a confidence score after 3+ runs (best improvement as a multiple of the noise floor). ≥2.0× = likely real, <1.0× = within noise. If confidence is below 1.0×, consider re-running the same experiment to confirm before keeping. The score is advisory — it never auto-discards.",
@@ -2228,6 +3199,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx);
+      refreshRuntimeConfig(runtime, ctx.cwd);
       const state = runtime.state;
 
       // Validate working directory exists
@@ -2241,6 +3213,104 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const workDir = resolveWorkDir(ctx.cwd);
       const secondaryMetrics = params.metrics ?? {};
 
+      if (runtime.pausedByBudget) {
+        return {
+          content: [{
+            type: "text",
+            text: `🛑 Autoresearch is paused by budget constraints. Re-run init_experiment or adjust autoresearch.config.json budget limits.`,
+          }],
+          details: {
+            experiment: {
+              commit: shortCommit(params.commit),
+              metric: params.metric,
+              metrics: secondaryMetrics,
+              status: params.status,
+              description: params.description,
+              timestamp: Date.now(),
+              segment: state.currentSegment,
+              confidence: null,
+              iterationTokens: null,
+              schemaVersion: AUTORESEARCH_SCHEMA_VERSION,
+            },
+            state: cloneExperimentState(state),
+            wallClockSeconds: runtime.lastRunDuration,
+            budgetCheck: {
+              paused: true,
+              reason: "paused by budget limits",
+            },
+          },
+        };
+      }
+
+      // Enforce strict run/log pairing (one run must be completed before logging).
+      const pendingRunId = runtime.pendingRunId;
+      if (
+        runtime.modeState !== AutoresearchModeState.AwaitingLog ||
+        !pendingRunId ||
+        !runtime.lastRunSummary ||
+        runtime.lastRunSummary.runId !== pendingRunId
+      ) {
+        transitionMachineState(
+          runtime,
+          AutoresearchMachineEvent.RunBlocked,
+          "log_experiment called without matching pending run"
+        );
+        return {
+          content: [{
+            type: "text",
+            text: `❌ Invalid log_experiment call order.
+
+log_experiment can only be called immediately after run_experiment (one-to-one).
+No matching pending run was found.
+
+Current state: ${runtime.modeState}
+Pending run ID: ${runtime.pendingRunId ?? "(none)"}
+
+Please call run_experiment first, then call log_experiment with the run result.`,
+          }],
+          details: {
+            modeState: runtime.modeState,
+            pendingRunId: runtime.pendingRunId,
+            hasRunSummary: !!runtime.lastRunSummary,
+          },
+        };
+      }
+
+      // Idempotency: avoid double-logging the same run
+      if (runtime.loggedRunIds.has(pendingRunId)) {
+        const existingIndex = state.results.findLastIndex((r) => r.runId === pendingRunId);
+        return {
+          content: [{
+            type: "text",
+            text: `✅ This run ID (${pendingRunId}) was already logged in this session. Duplicate log_experiment calls are ignored to preserve idempotency.`,
+          }],
+          details: {
+            experiment: (state.results[existingIndex] ?? runtime.lastRunSummary) as unknown as ExperimentResult,
+            state: cloneExperimentState(state),
+            wallClockSeconds: runtime.lastRunDuration,
+          },
+        };
+      }
+
+      const usage = ctx.getContextUsage();
+      if (usage?.tokens != null) {
+        recordIterationTokens(runtime, usage.tokens);
+        runtime.iterationStartTokens = usage.tokens;
+      }
+
+      // Gate: enforce metric contract before accepting keep/logs.
+      const summary = runtime.lastRunSummary;
+      const contractViolations = summary?.metricContractViolations ?? [];
+      if (params.status === "keep" && contractViolations.length > 0) {
+        return {
+          content: [{
+            type: "text",
+            text: `❌ Cannot keep this run due to contract violations: ${contractViolations.join("; ")}\n\nEither log with status='discard' or update your benchmark output to emit required metrics.`,
+          }],
+          details: {},
+        };
+      }
+
       // Gate: prevent "keep" when last run's checks failed
       if (params.status === "keep" && runtime.lastRunChecks && !runtime.lastRunChecks.pass) {
         return {
@@ -2252,7 +3322,37 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
-      // Validate secondary metrics consistency (after first experiment establishes them)
+      // Gate: enforce policy on file changes for successful keep attempts
+      if (params.status === "keep" && summary?.runArtifact) {
+        const changedCount = new Set([
+          ...summary.runArtifact.modifiedFiles,
+          ...summary.runArtifact.addedFiles,
+          ...summary.runArtifact.deletedFiles,
+          ...summary.runArtifact.untrackedFiles,
+        ]).size;
+        if (runtime.policy.maxModifiedFilesPerRun !== null && changedCount > runtime.policy.maxModifiedFilesPerRun) {
+          const message = `Keep blocked by policy: ${changedCount} changed files exceeds maxModifiedFilesPerRun=${runtime.policy.maxModifiedFilesPerRun}`;
+          if (!runtime.policy.allowSoftViolations) {
+            return {
+              content: [{ type: "text", text: `❌ ${message}\n\nLog this run as 'discard' or update policy limits.` }],
+              details: {
+                metricContractViolations: [message],
+                policyWarnings: [message],
+              },
+            };
+          }
+          // Soft violation: keep allowed but warn in ASI.
+          if (!params.asi) params.asi = {};
+          params.asi["policyWarnings"] = [message];
+          if (runtime.lastRunSummary) {
+            runtime.lastRunSummary.policyWarnings = [
+              ...(runtime.lastRunSummary.policyWarnings ?? []),
+              message,
+            ];
+          }
+        }
+      }
+
       if (state.secondaryMetrics.length > 0) {
         const knownNames = new Set(state.secondaryMetrics.map((m) => m.name));
         const providedNames = new Set(Object.keys(secondaryMetrics));
@@ -2287,12 +3387,33 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ? params.asi as ASI
         : undefined;
 
-      const runPhaseMismatch = runtime.modeState !== AutoresearchModeState.AwaitingLog;
-      const fallbackNotice = runPhaseMismatch
-        ? "\n\n⚠️ Note: log_experiment was called while not in AwaitingLog state. Applying for compatibility."
-        : "";
+      const runWarnings = [
+        ...(summary?.metricContractViolations ?? []),
+        ...(summary?.policyWarnings ?? []),
+      ];
+      const mergedASIWithWarnings = ((): ASI | undefined => {
+        if (!runWarnings.length && !mergedASI) return undefined;
+        const next: ASI = mergedASI ? { ...mergedASI } : {};
+        if (runWarnings.length > 0) {
+          next.policyWarnings = runWarnings;
+        }
+        return next;
+      })();
 
       const iterationTokens = lastIterationTokens(runtime);
+      const objectiveResult = evaluateObjectives(state, params.metric, secondaryMetrics);
+
+      if (params.status === "keep" && objectiveResult.violations.length > 0) {
+        return {
+          content: [{
+            type: "text",
+            text: `❌ Cannot keep this run — objective constraints not satisfied: ${objectiveResult.violations
+              .map((x) => `${x.metric} ${x.reason} ${x.expected} (actual=${x.actual})`)
+              .join("; ")}. Log this run as 'discard' and inspect constraints.`,
+          }],
+          details: {},
+        };
+      }
 
       const experiment: ExperimentResult = {
         commit: params.commit.slice(0, 7),
@@ -2304,11 +3425,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         segment: state.currentSegment,
         confidence: null,
         iterationTokens,
-        asi: mergedASI,
+        asi: mergedASIWithWarnings,
+        schemaVersion: AUTORESEARCH_SCHEMA_VERSION,
+        runId: summary?.runId,
+        artifactPath: summary?.artifactPath,
+        objectiveScore: objectiveResult.score,
+        objectiveViolations: objectiveResult.violations,
       };
 
       state.results.push(experiment);
       runtime.experimentsThisSession++;
+      if (experiment.runId) {
+        runtime.loggedRunIds.add(experiment.runId);
+      }
 
       // Register any new secondary metric names
       for (const name of Object.keys(secondaryMetrics)) {
@@ -2332,7 +3461,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Build response text
       const segmentCount = currentResults(state.results, state.currentSegment).length;
-      let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}${fallbackNotice}`;
+      let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
 
       if (state.bestMetric !== null) {
         text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
@@ -2342,6 +3471,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const sign = delta > 0 ? "+" : "";
           text += ` | this: ${formatNum(params.metric, state.metricUnit)} (${sign}${pct}%)`;
         }
+      }
+
+      if (experiment.objectiveScore !== null && experiment.objectiveScore !== undefined) {
+        text += `\nObjective score: ${experiment.objectiveScore.toFixed(4)}`;
+      }
+
+      if (summary?.artifactPath) {
+        text += `\nArtifact: ${summary.artifactPath}`;
       }
 
       // Show secondary metrics
@@ -2365,9 +3502,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       // Show ASI summary
-      if (mergedASI) {
+      if (mergedASIWithWarnings) {
         const asiParts: string[] = [];
-        for (const [k, v] of Object.entries(mergedASI)) {
+        for (const [k, v] of Object.entries(mergedASIWithWarnings)) {
           const s = typeof v === "string" ? v : JSON.stringify(v);
           asiParts.push(`${k}: ${s.length > 80 ? s.slice(0, 77) + "…" : s}`);
         }
@@ -2442,13 +3579,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Persist to autoresearch.jsonl (always, regardless of status)
       try {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+        const jsonlPath = path.join(workDir, AUTORESEARCH_STATE_FILE);
         const jsonlEntry: Record<string, unknown> = {
           run: state.results.length,
           ...experiment,
         };
         // Only write asi if present (keep lines compact when no ASI)
-        if (!mergedASI) delete jsonlEntry.asi;
+        if (!mergedASIWithWarnings) delete jsonlEntry.asi;
         fs.appendFileSync(jsonlPath, JSON.stringify(jsonlEntry) + "\n");
         broadcastDashboardUpdate(workDir);
       } catch (e) {
@@ -2474,12 +3611,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       runtime.lastRunDuration = null;
       clearPendingRun(runtime);
 
+      // Check budget constraints after logging
+      const budgetCheck = evaluateBudgetLimits(runtime);
+      const budgetPaused = budgetCheck.blocked;
+      if (budgetPaused) {
+        runtime.pausedByBudget = true;
+        runtime.autoresearchMode = false;
+      }
+
       // Check if max experiments limit reached
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
-      if (limitReached) {
-        text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
-        runtime.autoresearchMode = false;
-        transitionMachineState(runtime, AutoresearchMachineEvent.MaxReached, `segment max reached: ${state.maxExperiments}`);
+      if (limitReached || budgetPaused) {
+        const terminalReason = budgetPaused
+          ? `budget reached: ${budgetCheck.reason}`
+          : `segment max reached: ${state.maxExperiments}`;
+        if (budgetPaused) {
+          text += `\n\n🛑 Budget reached (${budgetCheck.reason}). Autoresearch paused.`;
+        } else {
+          text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
+        }
+        transitionMachineState(
+          runtime,
+          AutoresearchMachineEvent.MaxReached,
+          terminalReason
+        );
         ctx.abort();
       } else {
         transitionMachineState(
@@ -2500,6 +3655,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           experiment: { ...experiment, metrics: { ...experiment.metrics } },
           state: cloneExperimentState(state),
           wallClockSeconds,
+          budgetCheck: budgetPaused
+            ? {
+                paused: true,
+                reason: budgetCheck.reason ?? "budget reached",
+              }
+            : undefined,
+          runArtifact: summary?.runArtifact,
         } as LogDetails,
       };
     },
@@ -2574,6 +3736,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           parts.push(`${name}=${formatNum(value, def?.unit ?? "")}`);
         }
         text += theme.fg("dim", `  ${parts.join(" ")}`);
+      }
+
+      if (exp.objectiveScore !== null && exp.objectiveScore !== undefined) {
+        text += theme.fg("dim", `  objective=${exp.objectiveScore.toFixed(3)}`);
+      }
+
+      if (exp.objectiveViolations && exp.objectiveViolations.length > 0) {
+        text += theme.fg("warning", `  objective-violations=${exp.objectiveViolations.length}`);
+      }
+
+      if (exp.artifactPath) {
+        text += theme.fg("dim", `  artifact=${exp.artifactPath}`);
       }
 
       return new Text(text, 0, 0);
@@ -2780,7 +3954,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   function readJsonlContent(workDir: string): string {
-    return fs.readFileSync(path.join(workDir, "autoresearch.jsonl"), "utf-8").trim();
+    return fs.readFileSync(path.join(workDir, AUTORESEARCH_STATE_FILE), "utf-8").trim();
   }
 
   function extractSessionName(jsonlContent: string): string {
@@ -2872,7 +4046,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   function resolveServedFile(workDir: string, requestPath: string): string | null {
     if (requestPath === "/") return dashboardServerHtmlPath;
-    if (requestPath === "/autoresearch.jsonl") return path.join(workDir, "autoresearch.jsonl");
+    if (requestPath === "/autoresearch.jsonl") return path.join(workDir, AUTORESEARCH_STATE_FILE);
     return null;
   }
 
@@ -2957,7 +4131,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   async function exportDashboard(ctx: ExtensionContext): Promise<void> {
     const workDir = resolveWorkDir(ctx.cwd);
-    const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+    const jsonlPath = path.join(workDir, AUTORESEARCH_STATE_FILE);
 
     if (!fs.existsSync(jsonlPath)) {
       ctx.ui.notify("No autoresearch.jsonl found \u2014 run some experiments first", "error");
@@ -2986,6 +4160,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     description: "Start, stop, clear, or resume autoresearch mode",
     handler: async (args, ctx) => {
       const runtime = getRuntime(ctx);
+      refreshRuntimeConfig(runtime, ctx.cwd);
       const trimmedArgs = (args ?? "").trim();
       const command = trimmedArgs.toLowerCase();
 
@@ -3003,6 +4178,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.lastRunChecks = null;
         runtime.lastRunDuration = null;
         runtime.runningExperiment = null;
+        runtime.pausedByBudget = false;
+        runtime.segmentStartedAt = null;
         clearPendingRun(runtime);
         transitionMachineState(runtime, AutoresearchMachineEvent.ModeOff, "user /autoresearch off");
         stopDashboardServer();
@@ -3017,17 +4194,24 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "clear") {
-        const jsonlPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.jsonl");
+        const jsonlPath = path.join(resolveWorkDir(ctx.cwd), AUTORESEARCH_STATE_FILE);
         runtime.autoresearchMode = false;
         runtime.dashboardExpanded = false;
         runtime.lastAutoResumeTime = 0;
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
         runtime.lastRunChecks = null;
+        runtime.lastRunDuration = null;
         runtime.runningExperiment = null;
+        runtime.pausedByBudget = false;
+        runtime.segmentStartedAt = null;
+        runtime.loggedRunIds = new Set();
         clearPendingRun(runtime);
         transitionMachineState(runtime, AutoresearchMachineEvent.Clear, "user /autoresearch clear");
         runtime.state = createExperimentState();
+        const obj = readObjectives(ctx.cwd);
+        runtime.state.objectiveWeights = obj.metricWeights;
+        runtime.state.objectiveConstraints = obj.constraints;
         stopDashboardServer();
         updateWidget(ctx);
 
