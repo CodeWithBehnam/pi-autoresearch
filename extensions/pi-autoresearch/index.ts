@@ -120,6 +120,37 @@ interface LogDetails {
   wallClockSeconds: number | null;
 }
 
+enum AutoresearchModeState {
+  Idle = "idle",
+  Active = "active",
+  Rehydrating = "rehydrating",
+  SegmentReady = "segment_ready",
+  Running = "running",
+  AwaitingLog = "awaiting_log",
+  Terminal = "terminal",
+}
+
+enum AutoresearchMachineEvent {
+  RehydrateStart = "rehydrate_start",
+  RehydrateDone = "rehydrate_done",
+  ModeOn = "mode_on",
+  ModeOff = "mode_off",
+  Clear = "clear",
+  InitExperiment = "init_experiment",
+  RunRequested = "run_requested",
+  RunBlocked = "run_blocked",
+  RunCompleted = "run_completed",
+  LogApplied = "log_applied",
+  MaxReached = "max_reached",
+}
+
+interface AutoresearchMachineTrace {
+  event: AutoresearchMachineEvent;
+  to: AutoresearchModeState;
+  at: number;
+  reason?: string;
+}
+
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
   dashboardExpanded: boolean;
@@ -134,6 +165,95 @@ interface AutoresearchRuntime {
   iterationStartTokens: number | null;
   /** Token cost of each completed iteration (for predicting context exhaustion). */
   iterationTokenHistory: number[];
+
+  /** Explicit machine state for autoresearch workflow and transition tracking. */
+  modeState: AutoresearchModeState;
+  /** Last machine transition for debug and reconciliation. */
+  lastMachineTrace: AutoresearchMachineTrace | null;
+  /** Id for the pending run awaiting log_experiment; tracks run/log ownership. */
+  pendingRunId: string | null;
+  /** Last captured run details, for optional ownership checks. */
+  lastRunSummary: RunDetails | null;
+}
+
+function createMachineTrace(
+  event: AutoresearchMachineEvent,
+  to: AutoresearchModeState,
+  reason?: string
+): AutoresearchMachineTrace {
+  return {
+    event,
+    to,
+    at: Date.now(),
+    reason,
+  };
+}
+
+function transitionMachineState(
+  runtime: AutoresearchRuntime,
+  event: AutoresearchMachineEvent,
+  reason?: string
+): AutoresearchModeState {
+  const current = runtime.modeState;
+  let next = current;
+
+  switch (event) {
+    case AutoresearchMachineEvent.ModeOn:
+      next = AutoresearchModeState.Active;
+      break;
+    case AutoresearchMachineEvent.ModeOff:
+    case AutoresearchMachineEvent.Clear:
+      next = AutoresearchModeState.Idle;
+      break;
+    case AutoresearchMachineEvent.RehydrateStart:
+      next = AutoresearchModeState.Rehydrating;
+      break;
+    case AutoresearchMachineEvent.RehydrateDone:
+      next = runtime.autoresearchMode ? AutoresearchModeState.SegmentReady : AutoresearchModeState.Idle;
+      break;
+    case AutoresearchMachineEvent.InitExperiment:
+      next = AutoresearchModeState.SegmentReady;
+      break;
+    case AutoresearchMachineEvent.RunRequested:
+      next = current === AutoresearchModeState.Terminal ? current : AutoresearchModeState.Running;
+      break;
+    case AutoresearchMachineEvent.RunBlocked:
+      next = (current === AutoresearchModeState.Idle || current === AutoresearchModeState.Terminal)
+        ? current
+        : AutoresearchModeState.SegmentReady;
+      break;
+    case AutoresearchMachineEvent.RunCompleted:
+      next = AutoresearchModeState.AwaitingLog;
+      break;
+    case AutoresearchMachineEvent.LogApplied:
+      if (runtime.state.maxExperiments !== null) {
+        const segCount = currentResults(runtime.state.results, runtime.state.currentSegment).length;
+        next = segCount >= runtime.state.maxExperiments
+          ? AutoresearchModeState.Terminal
+          : AutoresearchModeState.SegmentReady;
+      } else {
+        next = AutoresearchModeState.SegmentReady;
+      }
+      break;
+    case AutoresearchMachineEvent.MaxReached:
+      next = AutoresearchModeState.Terminal;
+      break;
+    default:
+      next = current;
+  }
+
+  runtime.modeState = next;
+  runtime.lastMachineTrace = createMachineTrace(event, next, reason);
+  return next;
+}
+
+function newPendingRunId(): string {
+  return randomBytes(6).toString("hex");
+}
+
+function clearPendingRun(runtime: AutoresearchRuntime): void {
+  runtime.pendingRunId = null;
+  runtime.lastRunSummary = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -643,6 +763,10 @@ function createSessionRuntime(): AutoresearchRuntime {
     state: createExperimentState(),
     iterationStartTokens: null,
     iterationTokenHistory: [],
+    modeState: AutoresearchModeState.Idle,
+    lastMachineTrace: null,
+    pendingRunId: null,
+    lastRunSummary: null,
   };
 }
 
@@ -1031,9 +1155,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const reconstructState = (ctx: ExtensionContext) => {
     const runtime = getRuntime(ctx);
+    transitionMachineState(runtime, AutoresearchMachineEvent.RehydrateStart, "session_start/session_tree");
     runtime.lastRunChecks = null;
     runtime.lastRunDuration = null;
     runtime.runningExperiment = null;
+    clearPendingRun(runtime);
     runtime.lastAutoResumeTime = 0;
     runtime.experimentsThisSession = 0;
     runtime.autoResumeTurns = 0;
@@ -1150,6 +1276,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists
     runtime.autoresearchMode = fs.existsSync(path.join(workDir, "autoresearch.jsonl"));
+
+    // Drive machine state from reconstructed persistence
+    transitionMachineState(
+      runtime,
+      runtime.autoresearchMode
+        ? AutoresearchMachineEvent.RehydrateDone
+        : AutoresearchMachineEvent.ModeOff,
+      "reconstruction complete"
+    );
 
     updateWidget(ctx);
   };
@@ -1493,6 +1628,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       runtime.autoresearchMode = true;
+      clearPendingRun(runtime);
+      transitionMachineState(runtime, AutoresearchMachineEvent.InitExperiment, "init_experiment called");
       runtime.iterationStartTokens = ctx.getContextUsage()?.tokens ?? null;
       updateWidget(ctx);
 
@@ -1557,6 +1694,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (state.maxExperiments !== null) {
         const segCount = currentResults(state.results, state.currentSegment).length;
         if (segCount >= state.maxExperiments) {
+          transitionMachineState(runtime, AutoresearchMachineEvent.RunBlocked, "segment max reached");
+          clearPendingRun(runtime);
           return {
             content: [{ type: "text", text: `🛑 Maximum experiments reached (${state.maxExperiments}). The experiment loop is done. To continue, call init_experiment to start a new segment.` }],
             details: {},
@@ -1569,6 +1708,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Guard: if autoresearch.sh exists, only allow running it
       const autoresearchShPath = path.join(workDir, "autoresearch.sh");
       if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
+        transitionMachineState(
+          runtime,
+          AutoresearchMachineEvent.RunBlocked,
+          "autoresearch.sh command guard"
+        );
+        clearPendingRun(runtime);
         return {
           content: [{
             type: "text",
@@ -1592,7 +1737,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       advanceIterationTracking(runtime, ctx);
       if (isContextExhausted(runtime, ctx)) {
+        transitionMachineState(runtime, AutoresearchMachineEvent.RunBlocked, "context window exhausted");
         runtime.autoresearchMode = false;
+        clearPendingRun(runtime);
         ctx.abort();
         return {
           content: [{ type: "text", text: "🛑 Context window almost full. Start a new pi session to continue — all progress is saved." }],
@@ -1600,6 +1747,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
+      transitionMachineState(
+        runtime,
+        AutoresearchMachineEvent.RunRequested,
+        `run command: ${params.command}`
+      );
+      runtime.pendingRunId = newPendingRunId();
+      runtime.lastRunSummary = null;
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
@@ -1850,6 +2004,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         metricName: state.metricName,
         metricUnit: state.metricUnit,
       };
+
+      transitionMachineState(
+        runtime,
+        AutoresearchMachineEvent.RunCompleted,
+        `exitCode=${exitCode} timedOut=${timedOut}`
+      );
+      runtime.lastRunSummary = details;
 
       // Build LLM response
       let text = "";
@@ -2126,6 +2287,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ? params.asi as ASI
         : undefined;
 
+      const runPhaseMismatch = runtime.modeState !== AutoresearchModeState.AwaitingLog;
+      const fallbackNotice = runPhaseMismatch
+        ? "\n\n⚠️ Note: log_experiment was called while not in AwaitingLog state. Applying for compatibility."
+        : "";
+
       const iterationTokens = lastIterationTokens(runtime);
 
       const experiment: ExperimentResult = {
@@ -2166,7 +2332,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Build response text
       const segmentCount = currentResults(state.results, state.currentSegment).length;
-      let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
+      let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}${fallbackNotice}`;
 
       if (state.bestMetric !== null) {
         text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
@@ -2306,14 +2472,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       runtime.runningExperiment = null;
       runtime.lastRunChecks = null;
       runtime.lastRunDuration = null;
-
+      clearPendingRun(runtime);
 
       // Check if max experiments limit reached
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
       if (limitReached) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
         runtime.autoresearchMode = false;
+        transitionMachineState(runtime, AutoresearchMachineEvent.MaxReached, `segment max reached: ${state.maxExperiments}`);
         ctx.abort();
+      } else {
+        transitionMachineState(
+          runtime,
+          AutoresearchMachineEvent.LogApplied,
+          `logged status=${params.status}`
+        );
       }
 
       updateWidget(ctx);
@@ -2827,10 +3000,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.lastAutoResumeTime = 0;
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
-        runtime.pendingCompactResume = false;
         runtime.lastRunChecks = null;
         runtime.lastRunDuration = null;
         runtime.runningExperiment = null;
+        clearPendingRun(runtime);
+        transitionMachineState(runtime, AutoresearchMachineEvent.ModeOff, "user /autoresearch off");
         stopDashboardServer();
         clearSessionUi(ctx);
         ctx.ui.notify("Autoresearch mode OFF", "info");
@@ -2851,6 +3025,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.experimentsThisSession = 0;
         runtime.lastRunChecks = null;
         runtime.runningExperiment = null;
+        clearPendingRun(runtime);
+        transitionMachineState(runtime, AutoresearchMachineEvent.Clear, "user /autoresearch clear");
         runtime.state = createExperimentState();
         stopDashboardServer();
         updateWidget(ctx);
@@ -2878,6 +3054,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       runtime.autoresearchMode = true;
       runtime.autoResumeTurns = 0;
+      transitionMachineState(runtime, AutoresearchMachineEvent.ModeOn, `user /autoresearch ${trimmedArgs}`);
 
       const mdPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.md");
       const hasRules = fs.existsSync(mdPath);
